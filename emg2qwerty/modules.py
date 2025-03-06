@@ -239,6 +239,78 @@ class TDSFullyConnectedBlock(nn.Module):
         x = x + inputs
         return self.layer_norm(x)  # TNC
 
+class EMGTDSConv2dBlock(nn.Module):
+    """
+    A TDS convolution block modified for EMG signal processing with:
+    1. Dilated convolutions for better temporal receptive field
+    2. Channel-temporal attention mechanism for focusing on relevant EMG patterns
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        width: int,
+        kernel_width: int,
+        dilation_rate: int = 2,
+        window_size: int = 32
+    ) -> None:
+        super().__init__()
+        self.channels = channels
+        self.width = width
+        self.window_size=window_size
+
+        self.conv2d = nn.Conv2d( # adding dialation to increase context length
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=(1, kernel_width),
+            dilation=(1, dilation_rate), 
+            padding=(0, (kernel_width - 1) * dilation_rate // 2), 
+        )
+
+        
+        self.channel_attn = nn.Sequential(  # network within network idea to connect features across channels (spatial)
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 4, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(channels // 4, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+        # 1D conv over time
+        self.temporal_attn = nn.Sequential(
+            nn.Conv2d(1, 1, kernel_size=(1, self.window_size), padding="same"),
+            nn.Sigmoid(), # forces output to be (0,1), making this a sort of priority filter (like the prority gate in GRU).
+        )
+
+        self.relu = nn.ReLU()
+        self.layer_norm = nn.LayerNorm(channels * width)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        T_in, N, C = inputs.shape  # TNC
+
+        # TNC -> NCT -> NcwT
+        x = inputs.movedim(0, -1).reshape(N, self.channels, self.width, T_in)
+
+        x = self.conv2d(x) # conv is now dialted
+        x = self.relu(x)
+            
+        x = x * self.channel_attn(x)
+
+        # Temporal attention
+        avg_pool = torch.mean(x, dim=1, keepdim=True)
+
+        # A prority gate over time segements in past.
+        x = x * self.temporal_attn(avg_pool) # element wise
+
+        # Reshape back to TNC format
+        x = x.reshape(N, C, -1).movedim(-1, 0)  # NcwT -> NCT -> TNC
+
+        # Skip connection
+        T_out = x.shape[0]
+        x = x + inputs[-T_out:]
+
+        # Layer norm over C
+        return self.layer_norm(x)  # TNC
 
 class TDSConvEncoder(nn.Module):
     """A time depth-separable convolutional encoder composing a sequence
@@ -270,7 +342,7 @@ class TDSConvEncoder(nn.Module):
             ), "block_channels must evenly divide num_features"
             tds_conv_blocks.extend(
                 [
-                    TDSConv2dBlock(channels, num_features // channels, kernel_width),
+                    EMGTDSConv2dBlock(channels, num_features // channels, kernel_width),
                     TDSFullyConnectedBlock(num_features),
                 ]
             )
